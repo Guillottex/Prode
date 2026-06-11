@@ -1,0 +1,93 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ---------- Helpers ----------
+    function firmado() {
+      return request.auth != null;
+    }
+
+    function esAdmin() {
+      return firmado() &&
+        get(/databases/$(database)/documents/usuarios/$(request.auth.uid)).data.rol == 'admin';
+    }
+
+    function usuarioActivo() {
+      return firmado() &&
+        get(/databases/$(database)/documents/usuarios/$(request.auth.uid)).data.activo == true;
+    }
+
+    // ---------- usuarios ----------
+    match /usuarios/{uid} {
+      // El ranking necesita leer todos los perfiles
+      allow read: if firmado();
+
+      // Alta del propio perfil al registrarse: siempre rol "usuario" y puntaje 0
+      allow create: if firmado()
+        && request.auth.uid == uid
+        && request.resource.data.rol == 'usuario'
+        && request.resource.data.puntaje == 0
+        && request.resource.data.aciertosExactos == 0
+        && request.resource.data.activo == true;
+
+      // El usuario edita sus datos personales pero nunca rol / puntaje / estado.
+      // El admin puede modificar todo (promover admins, desactivar, recalcular).
+      allow update: if esAdmin()
+        || (request.auth.uid == uid
+            && !request.resource.data.diff(resource.data).affectedKeys()
+                 .hasAny(['rol', 'puntaje', 'aciertosExactos', 'activo']));
+
+      allow delete: if esAdmin();
+    }
+
+    // ---------- partidos ----------
+    match /partidos/{partidoId} {
+      allow read: if firmado();
+      allow create, update, delete: if esAdmin();
+    }
+
+    // ---------- pronosticos ----------
+    // ID de documento: {uid}_{partidoId}  -> garantiza 1 pronóstico por partido
+    match /pronosticos/{pronosticoId} {
+      function partido() {
+        return get(/databases/$(database)/documents/partidos/$(request.resource.data.partidoId)).data;
+      }
+
+      function partidoAbierto() {
+        // El estado lo maneja el admin (manual o automático).
+        // Límite duro adicional: nunca después del inicio del partido.
+        return partido().estado == 'abierto'
+          && (partido().timestamp == null || request.time < partido().timestamp);
+      }
+
+      function datosValidos() {
+        return request.resource.data.uid == request.auth.uid
+          && pronosticoId == request.auth.uid + '_' + request.resource.data.partidoId
+          && request.resource.data.golesLocal is int
+          && request.resource.data.golesVisitante is int
+          && request.resource.data.golesLocal >= 0
+          && request.resource.data.golesVisitante >= 0
+          && request.resource.data.golesLocal <= 30
+          && request.resource.data.golesVisitante <= 30;
+      }
+
+      // Cada usuario lee solo lo suyo; el admin lee todo (para recalcular)
+      allow read: if firmado() && (resource.data.uid == request.auth.uid || esAdmin());
+
+      // Crear / modificar solo con el partido abierto y usuario activo
+      allow create: if usuarioActivo() && datosValidos() && partidoAbierto();
+      allow update: if esAdmin()
+        || (usuarioActivo() && datosValidos() && partidoAbierto()
+            && request.resource.data.uid == resource.data.uid);
+
+      allow delete: if esAdmin();
+    }
+
+    // ---------- configuracion ----------
+    match /configuracion/{doc} {
+      allow read: if firmado();
+      allow write: if esAdmin();
+    }
+  }
+}
